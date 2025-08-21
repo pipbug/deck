@@ -1,0 +1,31 @@
+#!/bin/bash
+# Simple battery command - reads from status file
+# Usage: battery [percent|voltage|raw|json|status]
+
+STATUS_FILE="/tmp/battery_status.json"
+
+if [ ! -f "$STATUS_FILE" ]; then
+    echo "Error: Battery status file not found. Is battery monitor running?"
+    exit 1
+fi
+
+case "${1:-status}" in
+    "percent"|"p")
+        jq -r '.battery.percent_user' "$STATUS_FILE" 2>/dev/null | xargs printf "%.1f\n"
+        ;;
+    "voltage"|"v") 
+        jq -r '.battery.voltage' "$STATUS_FILE" 2>/dev/null | xargs printf "%.3f\n"
+        ;;
+    "raw"|"r")
+        jq -r '.battery.percent_raw' "$STATUS_FILE" 2>/dev/null | xargs printf "%.1f\n"
+        ;;
+    "json"|"j")
+        cat "$STATUS_FILE"
+        ;;
+    "status"|"s"|*)
+        PERCENT=$(jq -r '.battery.percent_user' "$STATUS_FILE" 2>/dev/null | xargs printf "%.1f")
+        VOLTAGE=$(jq -r '.battery.voltage' "$STATUS_FILE" 2>/dev/null | xargs printf "%.3f")
+        UPDATED=$(jq -r '.last_updated' "$STATUS_FILE" 2>/dev/null)
+        echo "Battery: ${PERCENT}% (${VOLTAGE}V) - Updated: ${UPDATED}"
+        ;;
+esac

@@ -1,0 +1,11 @@
+[Unit]
+Description=Update Battery Status
+Requires=battery-oneshot.service
+
+[Timer]
+OnBootSec=10sec
+OnUnitActiveSec=30sec
+AccuracySec=5sec
+
+[Install]
+WantedBy=timers.target

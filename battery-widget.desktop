@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Battery Widget
+Comment=System tray battery widget
+Exec=python3 /opt/battery-widget/battery-widget.py
+Icon=battery-good-symbolic
+Terminal=false
+Hidden=false
+Categories=System;Monitor;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
