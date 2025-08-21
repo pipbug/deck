@@ -84,7 +84,7 @@ echo "Updating boot configuration..."
 cp /boot/firmware/config.txt /boot/firmware/config.txt.backup
 
 # Append cyberdeck configuration
-cat >> /boot/firmware/config.txt << 'EOF'
+cat > /boot/firmware/config.txt << 'EOF'
 
 # Cyberdeck Configuration
 # GPIO pin assignments:
