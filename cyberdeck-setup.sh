@@ -101,7 +101,7 @@ cat > /boot/firmware/config.txt << 'EOF'
 dtparam=audio=off
 dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24
 dtoverlay=gpio-shutdown
-dtoverlay=pwm-gpio-fan,fan_gpio=27,fan_temp0=50000,fan_temp1=57500,fan_temp2=65000,fan_temp3=72500
+dtoverlay=pwm-gpio-fan,fan_gpio=27
 dtoverlay=vc4-kms-v3d
 dtoverlay=rpi-dsi-generic-pwm
 max_framebuffers=2
