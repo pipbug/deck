@@ -2,7 +2,7 @@
 # GPIO 23 - I2C SDA (to MAX17043 SDA pin)
 # GPIO 24 - I2C SCL (to MAX17043 SCL pin)  
 # GPIO 25 - Battery Alert (to MAX17043 ALRT pin - triggers shutdown when low)
-# GPIO 27 - Fan PWM
+# GPIO 17 - Fan
 # GPIO 4 - Charge port detection
 # GPIO 3 - Shutdown button
 # GPIO 18 - Backlight PWM
@@ -12,6 +12,7 @@ dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24
 dtoverlay=gpio-shutdown
 dtoverlay=vc4-kms-v3d
 dtoverlay=rpi-dsi-generic-pwm
+dtoverlay=gpio-fan,gpiopin=17
 max_framebuffers=2
 disable_fw_kms_setup=1
 disable_overscan=1
