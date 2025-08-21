@@ -60,7 +60,7 @@ echo "Installing battery widget desktop app..."
 
 # Create application directory
 mkdir -p /opt/battery-widget
-cp /usr/local/bin/battery-widget.py /opt/battery-widget/battery-widget
+cp /usr/local/bin/battery-widget.py /opt/battery-widget/battery-widget.py
 chmod +x /opt/battery-widget/battery-widget.py
 
 # Download desktop files
