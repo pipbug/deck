@@ -26,7 +26,9 @@ apt install -y \
     python3-smbus \
     python3-dbus \
     zenity \
-    jq
+    jq \
+    adwaita-icon-theme \
+    gnome-icon-theme-symbolic
 
 echo ""
 echo "Dependencies installed."
