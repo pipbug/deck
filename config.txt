@@ -12,7 +12,7 @@ dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24
 dtoverlay=gpio-shutdown
 dtoverlay=vc4-kms-v3d
 dtoverlay=rpi-dsi-generic-pwm
-dtoverlay=gpio-fan,gpiopin=17
+dtoverlay=gpio-fan,gpiopin=17,temp=55000
 max_framebuffers=2
 disable_fw_kms_setup=1
 disable_overscan=1
