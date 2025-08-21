@@ -1,0 +1,13 @@
+[Unit]
+Description=LED Controller for Caps Lock and Battery
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=python3 /usr/local/bin/led-control.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
