@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""
+Cyberdeck OLED Display Controller (Matrix Screen Only)
+128x32 OLED on I2C bus 4, address 0x3C
+"""
+
+import random
+import time
+
+from luma.core.interface.serial import i2c
+from luma.core.render import canvas
+from luma.oled.device import ssd1306
+from PIL import ImageFont
+
+
+class MatrixDisplay:
+    """
+    Controls a 128x32 OLED display to show a matrix rain animation.
+    """
+
+    def __init__(self):
+        """Initializes the display device, fonts, and animation variables."""
+        # Hardware & Fonts
+        self.serial = i2c(port=4, address=0x3C)
+        self.device = ssd1306(self.serial, width=128, height=32)
+        try:
+            self.font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 9
+            )
+        except:
+            self.font = ImageFont.load_default()
+
+        # Animations
+        self.matrix_chars = "01ABCDEFabcdef!@#$%^&*"
+        self.matrix_columns = []
+        self.init_matrix()
+
+    def init_matrix(self):
+        """Initializes matrix rain effect variables."""
+        for i in range(30):
+            self.matrix_columns.append(
+                {
+                    "x": 2 + (i * 4),
+                    "y": random.randint(-20, 0),
+                    "speed": random.randint(2, 5),
+                    "char": random.choice(self.matrix_chars),
+                }
+            )
+
+    def screen_matrix(self, draw):
+        """Draws the matrix rain animation."""
+#        draw.rectangle((0, 0, 127, 31), outline="white", fill=None)
+        for col in self.matrix_columns:
+            col["y"] += col["speed"]
+            if col["y"] > 32:
+                col["y"] = random.randint(-15, -5)
+                col["char"] = random.choice(self.matrix_chars)
+            if 1 <= col["y"] < 29 and 1 <= col["x"] < 126:
+                draw.text((col["x"], col["y"]), col["char"], font=self.font, fill="white")
+
+    def run_display(self):
+        """The main loop for drawing the animation to the display."""
+        while True:
+            with canvas(self.device) as draw:
+                self.screen_matrix(draw)
+            time.sleep(1 / 60)  # 60 FPS for smooth animation
+
+
+def main():
+    """Main function to initialize and run the display controller."""
+    print("Initializing Matrix Display...")
+    display = MatrixDisplay()
+
+    print("Display active - Press Ctrl+C to exit")
+    try:
+        display.run_display()
+    except KeyboardInterrupt:
+        print("\nShutting down display...")
+        display.device.cleanup()
+
+
+if __name__ == "__main__":
+    main()

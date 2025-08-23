@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+Cyberdeck OLED Display Controller (System, Weather, Network)
+128x32 OLED on I2C bus 4, address 0x3C
+"""
+
+import json
+import re
+import socket
+import subprocess
+import threading
+import time
+from datetime import datetime
+
+import psutil
+import requests
+from luma.core.interface.serial import i2c
+from luma.core.render import canvas
+from luma.oled.device import ssd1306
+from PIL import ImageFont
+
+
+class CyberdeckDisplay:
+    """
+    Controls a 128x32 OLED display to show various system metrics,
+    network information, and weather, with auto-cycling screens.
+    """
+
+    def __init__(self):
+        """Initializes the display device, fonts, and state variables."""
+        # Hardware & Fonts
+        self.serial = i2c(port=4, address=0x3C)
+        self.device = ssd1306(self.serial, width=128, height=32)
+        try:
+            self.font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 9
+            )
+        except:
+            self.font = ImageFont.load_default()
+
+        # Display State
+        self.current_screen = 0
+        self.total_screens = 3  # Reduced from 4
+        self.boot_time = psutil.boot_time()
+
+        # Caching & Location
+        self.weather_lat = "49.6866"  # Default: Courtenay, BC latitude
+        self.weather_lon = "-125.0011"  # Default: Courtenay, BC longitude
+        self.weather_location = "Courtenay, BC"  # Default location
+        self.cache_file = "/tmp/cyberdeck_weather.json"
+        self.weather_cache = {}
+        self.last_weather_update = 0
+        self.location_cache = {}
+        self.last_location_update = 0
+        self.region_abbreviations = {
+            # Canadian provinces
+            "Alberta": "AB", "British Columbia": "BC", "Manitoba": "MB",
+            "New Brunswick": "NB", "Newfoundland and Labrador": "NL",
+            "Northwest Territories": "NT", "Nova Scotia": "NS", "Nunavut": "NU",
+            "Ontario": "ON", "Prince Edward Island": "PE", "Quebec": "QC",
+            "Saskatchewan": "SK", "Yukon": "YT",
+            # US states
+            "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+            "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+            "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+            "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+            "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+            "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+            "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+            "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+            "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+            "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+            "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+            "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+            "Wisconsin": "WI", "Wyoming": "WY"
+        }
+        self.load_cache_from_file()
+        self.auto_detect_location()
+
+    # --- Utility & Data Retrieval Methods ---
+
+    def get_cpu_temp(self):
+        """Fetches CPU temperature from the system thermal zone."""
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                return float(f.read()) / 1000.0
+        except (FileNotFoundError, ValueError):
+            return 0.0
+
+    def get_system_info(self):
+        """Gathers and returns key system statistics."""
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        cpu_temp = self.get_cpu_temp()
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+
+        return {
+            "cpu_percent": cpu_percent,
+            "cpu_temp": cpu_temp,
+            "memory_percent": memory.percent,
+            "memory_used": memory.used / (1024**3),
+            "memory_total": memory.total / (1024**3),
+            "disk_percent": disk.percent,
+            "disk_used": disk.used / (1024**3),
+            "disk_total": disk.total / (1024**3),
+            "disk_free": disk.free / (1024**3),
+        }
+
+    def get_network_details(self):
+        """Fetches detailed network information, including IP, SSID, and I/O."""
+        try:
+            interfaces = psutil.net_if_addrs()
+            stats = psutil.net_if_stats()
+            io_counters = psutil.net_io_counters(pernic=True)
+            active_interface = None
+            ip_address = "No Connection"
+
+            for interface_name, addresses in interfaces.items():
+                if interface_name.startswith(("wl", "eth", "en")) and stats.get(
+                    interface_name
+                ) and stats[interface_name].isup:
+                    for addr in addresses:
+                        if (
+                            addr.family == socket.AF_INET
+                            and not addr.address.startswith("127.")
+                        ):
+                            active_interface = interface_name
+                            ip_address = addr.address
+                            break
+                    if active_interface:
+                        break
+
+            wifi_ssid, wifi_signal = "N/A", "N/A"
+            if active_interface and active_interface.startswith("wl"):
+                try:
+                    ssid_result = subprocess.run(
+                        ["iwgetid", "-r"], capture_output=True, text=True, timeout=2
+                    )
+                    if ssid_result.returncode == 0 and ssid_result.stdout.strip():
+                        wifi_ssid = ssid_result.stdout.strip()
+
+                    signal_result = subprocess.run(
+                        ["iwconfig", active_interface],
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                    )
+                    if signal_result.returncode == 0:
+                        signal_match = re.search(
+                            r"Signal level[=:](-?\d+)", signal_result.stdout
+                        )
+                        if signal_match:
+                            wifi_signal = f"{signal_match.group(1)}dBm"
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    pass
+
+            bytes_sent, bytes_recv, errors = 0, 0, 0
+            if active_interface in io_counters:
+                counter = io_counters[active_interface]
+                bytes_sent = counter.bytes_sent
+                bytes_recv = counter.bytes_recv
+                errors = counter.errin + counter.errout
+            total_packets = (
+                (io_counters[active_interface].packets_sent + io_counters[active_interface].packets_recv) if active_interface in io_counters else 1
+            )
+            packet_loss = (errors / total_packets) * 100 if total_packets > 0 else 0
+
+            return {
+                "interface": active_interface or "None",
+                "ip": ip_address,
+                "wifi_ssid": wifi_ssid,
+                "wifi_signal": wifi_signal,
+                "bytes_sent_mb": bytes_sent / (1024**2),
+                "bytes_recv_mb": bytes_recv / (1024**2),
+                "packet_loss": packet_loss,
+            }
+        except Exception:
+            return {
+                "interface": "Error",
+                "ip": "Unknown",
+                "wifi_ssid": "N/A",
+                "wifi_signal": "N/A",
+                "bytes_sent_mb": 0,
+                "bytes_recv_mb": 0,
+                "packet_loss": 0,
+            }
+
+    # --- Weather & Location Management ---
+
+    def load_cache_from_file(self):
+        """Loads cached weather and location data from a file."""
+        try:
+            with open(self.cache_file, "r") as f:
+                cache_data = json.load(f)
+            self.weather_cache = cache_data.get("weather_cache", {})
+            self.last_weather_update = cache_data.get("last_weather_update", 0)
+            self.location_cache = cache_data.get("location_cache", {})
+            self.last_location_update = cache_data.get("last_location_update", 0)
+            if self.location_cache:
+                self.weather_lat = self.location_cache["lat"]
+                self.weather_lon = self.location_cache["lon"]
+                self.weather_location = self.location_cache["location"]
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            self.weather_cache = {}
+            self.location_cache = {}
+
+    def save_cache_to_file(self):
+        """Saves current weather and location cache to a file."""
+        try:
+            cache_data = {
+                "weather_cache": self.weather_cache,
+                "last_weather_update": self.last_weather_update,
+                "location_cache": self.location_cache,
+                "last_location_update": self.last_location_update,
+            }
+            with open(self.cache_file, "w") as f:
+                json.dump(cache_data, f, indent=2)
+        except Exception:
+            pass
+
+    def auto_detect_location(self):
+        """Detects location using a free IP geolocation service."""
+        current_time = time.time()
+        if current_time - self.last_location_update < 7200 and self.location_cache:
+            return
+
+        for service_url in [
+            "http://ip-api.com/json/",
+            "https://ipapi.co/json/",
+            "https://freegeoip.app/json/",
+        ]:
+            try:
+                response = requests.get(service_url, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    lat = data.get("lat") or data.get("latitude")
+                    lon = data.get("lon") or data.get("longitude")
+                    city = data.get("city", "Unknown")
+                    region = data.get("regionName", data.get("region", ""))
+                    if not all([lat, lon]):
+                        continue
+
+                    abbreviated_region = self.region_abbreviations.get(region, region)
+                    location_str = f"{city}, {abbreviated_region}" if region else city
+
+                    location_changed = (
+                        not self.location_cache
+                        or self.location_cache.get("lat") != str(lat)
+                        or self.location_cache.get("lon") != str(lon)
+                        or self.location_cache.get("location") != location_str
+                    )
+
+                    self.weather_lat, self.weather_lon = str(lat), str(lon)
+                    self.weather_location = location_str
+                    self.location_cache = {
+                        "lat": self.weather_lat,
+                        "lon": self.weather_lon,
+                        "location": self.weather_location,
+                    }
+                    self.last_location_update = current_time
+
+                    if location_changed:
+                        self.weather_cache = {}
+                        self.last_weather_update = 0
+                    self.save_cache_to_file()
+                    return
+            except Exception:
+                continue
+
+    def get_weather(self):
+        """Fetches weather from Open-Meteo API, using a cache."""
+        current_time = time.time()
+        if current_time - self.last_weather_update < 600 and self.weather_cache:
+            cached_weather = self.weather_cache.copy()
+            cached_weather["location"] = self.weather_location
+            return cached_weather
+
+        try:
+            url = f"https://api.open-meteo.com/v1/forecast?latitude={self.weather_lat}&longitude={self.weather_lon}&current_weather=true"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                current = data.get("current_weather", {})
+                weather_codes = {
+                    0: "Clear Sky", 1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast",
+                    45: "Fog", 48: "Depositing Rime Fog", 51: "Light Drizzle", 53: "Moderate Drizzle",
+                    55: "Dense Drizzle", 56: "Light Freezing Drizzle", 57: "Dense Freezing Drizzle",
+                    61: "Slight Rain", 63: "Moderate Rain", 65: "Heavy Rain", 66: "Light Freezing Rain",
+                    67: "Heavy Freezing Rain", 71: "Slight Snow", 73: "Moderate Snow", 75: "Heavy Snow",
+                    77: "Snow Grains", 80: "Slight Rain Showers", 81: "Moderate Rain Showers",
+                    82: "Violent Rain Showers", 85: "Slight Snow Showers", 86: "Heavy Snow Showers",
+                    95: "Thunderstorm", 96: "Thunderstorm w/ Hail", 99: "Thunderstorm w/ Heavy Hail"
+                }
+                weather_info = {
+                    "description": weather_codes.get(current.get("weathercode"), "Unknown"),
+                    "temp": int(current.get("temperature", 0)),
+                    "location": self.weather_location,
+                }
+                self.weather_cache = weather_info
+                self.last_weather_update = current_time
+                self.save_cache_to_file()
+                return weather_info
+            return {
+                "description": "Weather Unavailable", "temp": 0, "location": self.weather_location
+            }
+        except Exception:
+            return {
+                "description": "Weather Error", "temp": 0, "location": self.weather_location
+            }
+
+    # --- Display Drawing Methods ---
+
+    def draw_progress_bar(self, draw, x, y, width, height, percent):
+        """Draws a simple progress bar."""
+        max_width = min(width, 127 - x)
+        if max_width <= 2:
+            return
+        draw.rectangle((x, y, x + max_width, y + height), outline="white", fill=None)
+        filled_width = int((percent / 100) * (max_width - 2))
+        if filled_width > 0:
+            draw.rectangle(
+                (x + 1, y + 1, x + 1 + filled_width, y + height - 1), fill="white"
+            )
+
+    def screen_system_status(self, draw):
+        """Draws system status (CPU, RAM, Disk)."""
+        draw.rectangle((0, 0, 127, 31), outline="white", fill=None)
+        info = self.get_system_info()
+        draw.text(
+            (2, 2),
+            f"CPU:{info['cpu_temp']:4.1f}°C {info['cpu_percent']:3.0f}%",
+            font=self.font,
+            fill="white",
+        )
+        self.draw_progress_bar(draw, 85, 2, 40, 8, info["cpu_percent"])
+        draw.text(
+            (2, 11),
+            f"RAM:{info['memory_used']:4.1f}/{info['memory_total']:3.1f}GB",
+            font=self.font,
+            fill="white",
+        )
+        self.draw_progress_bar(draw, 85, 11, 40, 8, info["memory_percent"])
+        draw.text(
+            (2, 20),
+            f"DISK:{info['disk_used']:4.0f}/{info['disk_total']:3.0f}GB",
+            font=self.font,
+            fill="white",
+        )
+        self.draw_progress_bar(draw, 85, 20, 40, 8, info["disk_percent"])
+
+    def screen_time_weather(self, draw):
+        """Draws time, date, and current weather."""
+        draw.rectangle((0, 0, 127, 31), outline="white", fill=None)
+        now = datetime.now()
+        weather = self.get_weather()
+        draw.text(
+            (2, 2),
+            now.strftime("%I:%M %p - %m/%d/%Y"),
+            font=self.font,
+            fill="white",
+        )
+        draw.text(
+            (2, 11),
+            f"{weather['temp']}°C - {weather['description']}",
+            font=self.font,
+            fill="white",
+        )
+        draw.text(
+            (2, 20), weather["location"], font=self.font, fill="white"
+        )
+
+    def screen_network(self, draw):
+        """Draws network interface details."""
+        draw.rectangle((0, 0, 127, 31), outline="white", fill=None)
+        net_info = self.get_network_details()
+        interface = net_info["interface"]
+        line1, line2 = "", ""
+
+        if interface.startswith("wl"):
+            line1 = f"SSID: {net_info['wifi_ssid']}"
+            line2 = f"Signal: {net_info['wifi_signal']}"
+        else:
+            line1 = f"RX:{net_info['bytes_recv_mb']:.0f}MB TX:{net_info['bytes_sent_mb']:.0f}MB"
+            line2 = f"Packet Loss: {net_info['packet_loss']:.1f}%"
+
+        def truncate_text(text, max_width):
+            while draw.textbbox((0, 0), text, font=self.font)[2] > max_width and len(
+                text
+            ) > 1:
+                text = text[:-1]
+            return text
+
+        draw.text(
+            (2, 2), truncate_text(line1, 125), font=self.font, fill="white"
+        )
+        draw.text(
+            (2, 11), truncate_text(line2, 125), font=self.font, fill="white"
+        )
+        line3 = f"{interface}: {net_info['ip']}"
+        draw.text(
+            (2, 20), truncate_text(line3, 125), font=self.font, fill="white"
+        )
+
+    # --- Main Control Loop ---
+
+    def run_display(self):
+        """The main loop for drawing screens to the display."""
+        screen_map = {
+            0: self.screen_system_status,
+            1: self.screen_time_weather,
+            2: self.screen_network,
+        }
+        while True:
+            with canvas(self.device) as draw:
+                screen_to_draw = screen_map.get(self.current_screen)
+                if screen_to_draw:
+                    screen_to_draw(draw)
+            time.sleep(1 / 60)
+
+    def cycle_screens(self):
+        """Background thread that cycles through display screens."""
+        while True:
+            time.sleep(5)
+            self.current_screen = (self.current_screen + 1) % self.total_screens
+
+
+def main():
+    """Main function to initialize and run the display controller."""
+    print("Initializing Cyberdeck Display...")
+    display = CyberdeckDisplay()
+
+    # Start screen cycling in a background thread
+    cycle_thread = threading.Thread(target=display.cycle_screens, daemon=True)
+    cycle_thread.start()
+
+    print("Display active - Press Ctrl+C to exit")
+    try:
+        display.run_display()
+    except KeyboardInterrupt:
+        print("\nShutting down display...")
+        display.save_cache_to_file()
+        display.device.cleanup()
+
+
+if __name__ == "__main__":
+    main()
