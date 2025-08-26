@@ -1,0 +1,23 @@
+# Fast Battery Monitor Service
+
+[Unit]
+Description=Battery Monitor
+Documentation=Battery monitoring with chip reset capability
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/bin/battery-oneshot.py
+StandardOutput=journal
+StandardError=journal
+
+# Ensure I2C access
+SupplementaryGroups=i2c gpio
+
+# Fast execution
+TimeoutStartSec=5
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

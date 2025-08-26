@@ -1,0 +1,37 @@
+[Unit]
+Description=Battery Alert Monitor
+After=multi-user.target
+After=battery-oneshot.timer
+Wants=battery-oneshot.timer
+Requisite=battery-oneshot.timer
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/bin/battery-alert.py
+
+# Restart on failure
+Restart=always
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+# Ensure proper permissions for desktop notifications
+SupplementaryGroups=gpio audio
+
+# Process management
+KillMode=mixed
+TimeoutStopSec=10
+TimeoutStartSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=battery-alert
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
