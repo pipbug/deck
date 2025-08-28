@@ -218,15 +218,9 @@ class BatterySystemTray:
         details_item.set_label("Show Details")
         details_item.connect("activate", self._show_details)
         
-        separator2 = Gtk.SeparatorMenuItem()
-        
-        reset_item = Gtk.MenuItem()
-        reset_item.set_label("Reset Fuel Gauge")
-        reset_item.connect("activate", self._manual_reset)
-        
         # Add items efficiently
         for item in (self.status_item, self.runtime_item, separator1, 
-                    details_item, separator2, reset_item):
+                    details_item):
             menu.append(item)
             item.show()
         
@@ -422,20 +416,6 @@ class BatterySystemTray:
         )
         
         self._show_message_dialog("Battery Details", details)
-    
-    def _manual_reset(self, widget):
-        """Trigger manual fuel gauge reset via monitor script"""
-        import subprocess
-        try:
-            # Call the monitor script to handle reset
-            result = subprocess.run(['python3', '/usr/local/bin/battery_monitor.py', '--reset'], 
-                                  capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                self._show_message_dialog("Reset Complete", "Fuel gauge reset successfully")
-            else:
-                self._show_message_dialog("Reset Failed", f"Error: {result.stderr}")
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            self._show_message_dialog("Reset Failed", f"Could not execute reset: {e}")
     
     def _show_message_dialog(self, title, message=""):
         """Show simple message dialog"""
