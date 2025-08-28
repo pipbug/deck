@@ -1,31 +1,82 @@
-#!/bin/bash
-# Simple battery command - reads from status file
-# Usage: battery [percent|voltage|raw|json|status]
+#!/usr/bin/env python3
+"""
+Battery Status Command
+Simple utility to display current battery status from JSON file
+"""
 
-STATUS_FILE="/tmp/battery_status.json"
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
 
-if [ ! -f "$STATUS_FILE" ]; then
-    echo "Error: Battery status file not found. Is battery monitor running?"
-    exit 1
-fi
+STATUS_FILE = '/tmp/battery_status.json'
 
-case "${1:-status}" in
-    "percent"|"p")
-        jq -r '.battery.percent_user' "$STATUS_FILE" 2>/dev/null | xargs printf "%.1f\n"
-        ;;
-    "voltage"|"v") 
-        jq -r '.battery.voltage' "$STATUS_FILE" 2>/dev/null | xargs printf "%.3f\n"
-        ;;
-    "raw"|"r")
-        jq -r '.battery.percent_raw' "$STATUS_FILE" 2>/dev/null | xargs printf "%.1f\n"
-        ;;
-    "json"|"j")
-        cat "$STATUS_FILE"
-        ;;
-    "status"|"s"|*)
-        PERCENT=$(jq -r '.battery.percent_user' "$STATUS_FILE" 2>/dev/null | xargs printf "%.1f")
-        VOLTAGE=$(jq -r '.battery.voltage' "$STATUS_FILE" 2>/dev/null | xargs printf "%.3f")
-        UPDATED=$(jq -r '.last_updated' "$STATUS_FILE" 2>/dev/null)
-        echo "Battery: ${PERCENT}% (${VOLTAGE}V) - Updated: ${UPDATED}"
-        ;;
-esac
+def format_timestamp(epoch_time):
+    """Convert epoch timestamp to human readable format"""
+    try:
+        return datetime.fromtimestamp(float(epoch_time)).strftime('%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError):
+        return 'Invalid timestamp'
+
+def read_battery_status():
+    """Read and parse battery status from JSON file"""
+    try:
+        if not Path(STATUS_FILE).exists():
+            print(f"Error: Battery status file not found: {STATUS_FILE}")
+            return False
+        
+        with open(STATUS_FILE, 'r') as f:
+            data = json.load(f)
+        
+        battery = data.get('battery')
+        if not battery:
+            print("Error: No battery data found in status file")
+            return False
+        
+        # Handle error case
+        if 'error' in battery:
+            print(f"Battery Error: {battery['error']}")
+            return True
+        
+        # Extract battery information
+        percent = battery.get('percent_user', 0)
+        voltage = battery.get('voltage', 0)
+        charging = battery.get('charging', False)
+        in_window = battery.get('in_window', False)
+        timestamp = battery.get('timestamp', 0)
+        
+        # Display formatted output
+        print(f"Battery Status:")
+        print(f"  Charge: {percent:.1f}%")
+        print(f"  Voltage: {voltage:.3f}V")
+        print(f"  Charging: {'Yes' if charging else 'No'}")
+        
+        if in_window:
+            print(f"  Status: In charging window")
+        
+        print(f"  Window Updated: {format_timestamp(timestamp)}")
+        
+        # Display status file timestamp if different
+        file_timestamp = data.get('timestamp')
+        if file_timestamp and file_timestamp != timestamp:
+            print(f"  File Updated: {format_timestamp(file_timestamp)}")
+        
+        return True
+        
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in status file: {e}")
+        return False
+    except OSError as e:
+        print(f"Error: Could not read status file: {e}")
+        return False
+    except Exception as e:
+        print(f"Error: Unexpected error: {e}")
+        return False
+
+def main():
+    """Main entry point"""
+    if not read_battery_status():
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
