@@ -1,457 +1,348 @@
 #!/usr/bin/env python3
 """
-Battery Oneshot with MAX Chip Reset
-Detects bad readings and resets MAX17048 fuel gauge when needed
+MAX17043 Battery Monitor Script
+Handles charging transitions, bad reading detection, and quick-start management
 """
 
-import time
-import smbus
 import json
-import os
+import time
+import logging
 from pathlib import Path
+from typing import Optional, Dict, Any
+import RPi.GPIO as GPIO
 
-# Configuration
-RESET_COOLDOWN = 300  # 5 minutes between resets
-BAD_READING_THRESHOLD = 1  # Reset after 1 bad reading
-STATE_FILE = '/tmp/battery_reset_state.json'
+try:
+    import smbus2 as smbus
+except ImportError:
+    import smbus
+
+# Configuration constants
+MAX17043_ADDRESS = 0x36
+VCELL_REGISTER = 0x02
+SOC_REGISTER = 0x04
+MODE_REGISTER = 0x06
+QUICK_START_COMMAND = 0x4000
+
+CHARGE_DETECT_PIN = 4
+STATUS_FILE = '/tmp/battery_status.json'
+STATE_FILE = '/tmp/battery_monitor_state.json'
+
+CHARGING_WINDOW_DURATION = 300  # 5 minutes in seconds
+QUICK_START_COOLDOWN = 300  # 5 minutes in seconds
+BAD_READING_THRESHOLD = 0.20  # 20% deviation threshold
+
+# Standard Li-ion voltage curve (voltage -> expected SOC%)
+LIION_VOLTAGE_CURVE = [
+    (4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85), (4.00, 80),
+    (3.95, 75), (3.90, 70), (3.85, 65), (3.80, 60), (3.75, 55),
+    (3.70, 50), (3.65, 45), (3.60, 40), (3.55, 35), (3.50, 30),
+    (3.45, 25), (3.40, 20), (3.35, 15), (3.30, 10), (3.25, 5), (3.00, 0)
+]
+
 
 class BatteryMonitor:
     def __init__(self):
-        self.bus = smbus.SMBus(3)
-        self.chip_address = 0x36
-        self.load_state()
+        self.logger = self._setup_logging()
+        self.bus = None
+        self.gpio_ready = False
+        self.state = self._load_state()
         
-        # Note: No longer configuring alert threshold since we use layered monitoring
+    def _setup_logging(self) -> logging.Logger:
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('/tmp/battery_monitor.log')
+            ]
+        )
+        return logging.getLogger('BatteryMonitor')
     
-    def check_current_alert_threshold(self):
-        """Check current alert threshold setting with detailed debugging"""
+    def _load_state(self) -> Dict[str, Any]:
+        """Load persistent state from file"""
         try:
-            # Read config register (0x0C)
-            config_raw = self.bus.read_word_data(self.chip_address, 0x0C)
-            config_swapped = (config_raw & 0xFF) << 8 | (config_raw >> 8)
-            
-            # Alert threshold is in upper 8 bits
-            alert_threshold_reg = config_swapped >> 8
-            
-            # Convert register value to percentage using MAX17048 formula
-            # Formula: percentage = 32 - (register_value / 2)
-            raw_percentage = 32 - (alert_threshold_reg / 2)
-            user_percentage = (raw_percentage - 15) * 1.176470588
-            
-            print(f"=== ALERT THRESHOLD DEBUG ===")
-            print(f"Raw register read: 0x{config_raw:04X}")
-            print(f"Swapped config: 0x{config_swapped:04X}")
-            print(f"Alert threshold register: 0x{alert_threshold_reg:02X} ({alert_threshold_reg})")
-            print(f"Calculated raw percentage: {raw_percentage}%")
-            print(f"Calculated user percentage: {user_percentage:.1f}%")
-            print(f"=============================")
-            
-            return {
-                'register_value': alert_threshold_reg,
-                'raw_percentage': raw_percentage,
-                'user_percentage': user_percentage,
-                'config_raw': config_raw,
-                'config_swapped': config_swapped
-            }
-            
-        except Exception as e:
-            print(f"Failed to read alert threshold: {e}")
-            return None
-    
-    def configure_alert_threshold(self):
-        """Configure MAX17048 alert threshold to 15% (0% user)"""
-        try:
-            # Check current setting first
-            current = self.check_current_alert_threshold()
-            if current and abs(current['raw_percentage'] - 15.0) < 0.1:
-                print("Alert threshold already correctly set")
-                return True
-            
-            # Alert threshold register is 0x0D
-            # Alert threshold = (32 - alert_percent) * 2
-            # For 15% raw (0% user): (32 - 15) * 2 = 34 = 0x22
-            alert_threshold = 0x22  # 15% raw percentage
-            
-            # Read current config register (0x0C) to preserve other settings
-            config_raw = self.bus.read_word_data(self.chip_address, 0x0C)
-            config_swapped = (config_raw & 0xFF) << 8 | (config_raw >> 8)
-            
-            # Set alert threshold in upper 8 bits, preserve lower 8 bits
-            new_config = (alert_threshold << 8) | (config_swapped & 0xFF)
-            
-            # Swap bytes for write (SMBus is little endian)
-            config_to_write = ((new_config & 0xFF) << 8) | (new_config >> 8)
-            
-            # Write new configuration
-            self.bus.write_word_data(self.chip_address, 0x0C, config_to_write)
-            
-            # Verify the setting
-            time.sleep(0.1)
-            verify_raw = self.bus.read_word_data(self.chip_address, 0x0C)
-            verify_swapped = (verify_raw & 0xFF) << 8 | (verify_raw >> 8)
-            set_threshold = verify_swapped >> 8
-            
-            if set_threshold == alert_threshold:
-                print(f"Alert threshold configured successfully: 15% raw (0% user)")
-                return True
-            else:
-                print(f"Alert threshold verification failed: got 0x{set_threshold:02X}, expected 0x{alert_threshold:02X}")
-                return False
-                
-        except Exception as e:
-            print(f"Failed to configure alert threshold: {e}")
-            return False
-    
-    def load_state(self):
-        """Load persistent state"""
-        try:
-            with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-            self.last_reset = state.get('last_reset', 0)
-            self.bad_reading_count = state.get('bad_reading_count', 0)
-            self.last_voltage = state.get('last_voltage', 0)
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.last_reset = 0
-            self.bad_reading_count = 0
-            self.last_voltage = 0
-    
-    def save_state(self):
-        """Save persistent state"""
-        state = {
-            'last_reset': self.last_reset,
-            'bad_reading_count': self.bad_reading_count,
-            'last_voltage': self.last_voltage
+            if Path(STATE_FILE).exists():
+                with open(STATE_FILE, 'r') as f:
+                    return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            self.logger.warning(f"Could not load state file: {e}")
+        
+        return {
+            'last_quick_start': 0,
+            'charging_window_start': 0,
+            'last_charger_state': False
         }
+    
+    def _save_state(self):
+        """Save persistent state to file"""
         try:
             with open(STATE_FILE, 'w') as f:
-                json.dump(state, f)
-            os.chmod(STATE_FILE, 0o644)
-        except:
-            pass
+                json.dump(self.state, f, indent=2)
+        except OSError as e:
+            self.logger.error(f"Could not save state file: {e}")
     
-    def read_raw_data(self):
-        """Read raw data from MAX chip"""
-        vcell_raw = self.bus.read_word_data(self.chip_address, 0x02)
-        soc_raw = self.bus.read_word_data(self.chip_address, 0x04)
-        
-        voltage = ((vcell_raw & 0xFF) << 8 | (vcell_raw >> 8)) * 0.000078125
-        soc_swapped = (soc_raw & 0xFF) << 8 | (soc_raw >> 8)
-        raw_percent = (soc_swapped >> 8) + (soc_swapped & 0xFF) / 256.0
-        user_percent = min(100.0, max(0.0, (raw_percent - 15) * 1.176470588))
-        
-        return voltage, raw_percent, user_percent
-    
-    def is_bad_reading(self, voltage, raw_percent, user_percent):
-        """Detect obviously incorrect readings from MAX chip with voltage validation"""
-        current_time = time.time()
-        
-        # Enhanced voltage validation for layered approach
-        if voltage > 4.3 or voltage < 2.5:
-            return True, f"Impossible voltage: {voltage:.3f}V"
-        
-        # Check for impossible voltage/percentage combinations
-        if voltage > 4.0 and user_percent < 30:
-            return True, "High voltage, low percentage"
-        
-        if voltage < 3.5 and user_percent > 70:
-            return True, "Low voltage, high percentage"
-        
-        # Additional voltage-percentage correlation checks
-        if voltage > 3.8 and user_percent < 10:
-            return True, f"Voltage too high for percentage: {voltage:.3f}V at {user_percent:.1f}%"
-        
-        if voltage < 3.3 and user_percent > 50:
-            return True, f"Voltage too low for percentage: {voltage:.3f}V at {user_percent:.1f}%"
-        
-        # Check for sudden voltage jumps (> 0.5V change)
-        if self.last_voltage > 0:
-            voltage_change = abs(voltage - self.last_voltage)
-            if voltage_change > 0.5:
-                return True, f"Sudden voltage change: {voltage_change:.3f}V"
-        
-        # Check for percentage out of reasonable bounds
-        if raw_percent < 0 or raw_percent > 110:
-            return True, f"Raw percentage out of bounds: {raw_percent:.1f}%"
-        
-        # Check for impossible user percentage (should be 0-100)
-        if user_percent < -5 or user_percent > 105:
-            return True, f"User percentage out of bounds: {user_percent:.1f}%"
-        
-        return False, ""
-    
-    def reset_max_chip(self):
-        """Reset MAX17048 fuel gauge chip"""
-        current_time = time.time()
-        
-        # Check cooldown period
-        if current_time - self.last_reset < RESET_COOLDOWN:
-            return False, "Reset cooldown active"
-        
+    def _init_i2c(self) -> bool:
+        """Initialize I2C bus"""
         try:
-            # MAX17048 reset command: write 0x5400 to register 0x0C
-            # Note: word data is sent LSB first, so 0x5400 becomes 0x0054
-            self.bus.write_word_data(self.chip_address, 0x0C, 0x0054)
-            
-            # Wait for reset to complete
-            time.sleep(0.5)
-            
-            # Update state
-            self.last_reset = current_time
-            self.bad_reading_count = 0
-            self.save_state()
-            
-            return True, "MAX chip reset successful"
-        
-        except Exception as e:
-            return False, f"Reset failed: {e}"
-    
-    def read_battery_with_validation(self):
-        """Read battery with bad reading detection and reset capability"""
-        try:
-            voltage, raw_percent, user_percent = self.read_raw_data()
-            
-            # Check if reading is bad
-            is_bad, reason = self.is_bad_reading(voltage, raw_percent, user_percent)
-            
-            if is_bad:
-                self.bad_reading_count += 1
-                
-                # Reset chip if we've had too many bad readings
-                if self.bad_reading_count >= BAD_READING_THRESHOLD:
-                    reset_success, reset_msg = self.reset_max_chip()
-                    
-                    if reset_success:
-                        # Try reading again after reset
-                        time.sleep(1)
-                        voltage, raw_percent, user_percent = self.read_raw_data()
-                        
-                        # Create status with reset info
-                        status = self.create_status(voltage, raw_percent, user_percent)
-                        status['reset_info'] = {
-                            'reset_performed': True,
-                            'reason': reason,
-                            'message': reset_msg,
-                            'timestamp': int(time.time())
-                        }
-                    else:
-                        # Reset failed, create status with error
-                        status = self.create_status(voltage, raw_percent, user_percent)
-                        status['reset_info'] = {
-                            'reset_attempted': True,
-                            'reset_failed': True,
-                            'reason': reason,
-                            'error': reset_msg,
-                            'timestamp': int(time.time())
-                        }
-                else:
-                    # Bad reading but not ready to reset yet
-                    status = self.create_status(voltage, raw_percent, user_percent)
-                    status['validation'] = {
-                        'bad_reading': True,
-                        'reason': reason,
-                        'bad_count': self.bad_reading_count,
-                        'threshold': BAD_READING_THRESHOLD
-                    }
-            else:
-                # Good reading - reset bad count
-                if self.bad_reading_count > 0:
-                    self.bad_reading_count = 0
-                    self.save_state()
-                
-                status = self.create_status(voltage, raw_percent, user_percent)
-                status['validation'] = {'reading_ok': True}
-            
-            # Update last voltage for next comparison
-            self.last_voltage = voltage
-            self.save_state()
-            
-            return status
-            
-        except Exception as e:
-            # I2C communication error
-            return self.create_error_status(f"I2C error: {e}")
-    
-    def create_status(self, voltage, raw_percent, user_percent):
-        """Create standard battery status with layered monitoring support"""
-        status = {
-            'battery': {
-                'voltage': round(voltage, 3),
-                'percent_user': round(user_percent, 1),
-                'percent_raw': round(raw_percent, 1),
-                'timestamp': int(time.time())
-            },
-            'last_updated': time.strftime('%H:%M:%S')
-        }
-        
-        # Add voltage-based condition flags for layered monitoring
-        if voltage <= 3.2 and voltage > 0:
-            status['battery']['voltage_critical'] = True
-        elif voltage <= 3.5 and voltage > 0:
-            status['battery']['voltage_warning'] = True
-        
-        # Add percentage-based condition flags
-        if user_percent <= 2:
-            status['battery']['percentage_critical'] = True
-        elif user_percent <= 5:
-            status['battery']['percentage_warning'] = True
-        
-        return status
-    
-    def create_error_status(self, error_msg):
-        """Create error status"""
-        return {
-            'battery': {
-                'voltage': 0,
-                'percent_user': 0,
-                'percent_raw': 0,
-                'timestamp': int(time.time()),
-                'error': error_msg
-            },
-            'last_updated': time.strftime('%H:%M:%S')
-        }
-    
-    def write_status(self, status):
-        """Write status to file"""
-        try:
-            with open('/tmp/battery_status.json', 'w') as f:
-                json.dump(status, f, separators=(',', ':'))
-            os.chmod('/tmp/battery_status.json', 0o644)
+            self.bus = smbus.SMBus(3)
+            # Test communication by reading version register
+            self.bus.read_word_data(MAX17043_ADDRESS, 0x08)
             return True
         except Exception as e:
+            self.logger.error(f"I2C initialization failed: {e}")
             return False
-
-
-def manual_reset():
-    """Manual reset command for testing"""
-    try:
-        monitor = BatteryMonitor()
-        success, message = monitor.reset_max_chip()
-        print(f"Manual reset: {message}")
-        return success
-    except Exception as e:
-        print(f"Manual reset failed: {e}")
-        return False
-
-
-def dump_all_registers():
-    """Dump all MAX17048 registers for debugging"""
-    try:
-        monitor = BatteryMonitor()
-        print("=== MAX17048 REGISTER DUMP ===")
+    
+    def _init_gpio(self) -> bool:
+        """Initialize GPIO for charge detection"""
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(CHARGE_DETECT_PIN, GPIO.IN)
+            self.gpio_ready = True
+            return True
+        except Exception as e:
+            self.logger.error(f"GPIO initialization failed: {e}")
+            return False
+    
+    def _read_register16(self, register: int) -> Optional[int]:
+        """Read 16-bit register from MAX17043"""
+        try:
+            if self.bus is None:
+                return None
+            data = self.bus.read_word_data(MAX17043_ADDRESS, register)
+            # Swap bytes (SMBus returns little-endian, MAX17043 uses big-endian)
+            return ((data & 0xFF) << 8) | ((data >> 8) & 0xFF)
+        except Exception as e:
+            self.logger.error(f"Failed to read register 0x{register:02X}: {e}")
+            return None
+    
+    def _write_register16(self, register: int, value: int) -> bool:
+        """Write 16-bit register to MAX17043"""
+        try:
+            if self.bus is None:
+                return False
+            # Swap bytes for big-endian format
+            swapped = ((value & 0xFF) << 8) | ((value >> 8) & 0xFF)
+            self.bus.write_word_data(MAX17043_ADDRESS, register, swapped)
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to write register 0x{register:02X}: {e}")
+            return False
+    
+    def _is_charging(self) -> bool:
+        """Check if charger is currently connected"""
+        if not self.gpio_ready:
+            return False
+        try:
+            return GPIO.input(CHARGE_DETECT_PIN) == GPIO.HIGH
+        except Exception as e:
+            self.logger.error(f"Failed to read charge detection pin: {e}")
+            return False
+    
+    def _is_in_charging_window(self) -> bool:
+        """Check if we're in a charging window period"""
+        current_time = time.time()
+        window_start = self.state.get('charging_window_start', 0)
         
-        registers = {
-            0x02: "VCELL",
-            0x04: "SOC", 
-            0x06: "MODE",
-            0x08: "VERSION",
-            0x0A: "HIBRT",
-            0x0C: "CONFIG",
-            0x0E: "VALRT",
-            0x10: "CRATE",
-            0x12: "VRESET",
-            0x14: "STATUS",
-            0x16: "TABLE"
+        # If currently charging, we're always in window
+        if self._is_charging():
+            return True
+            
+        # If not charging, check if we're within window period after disconnect
+        if window_start > 0:
+            elapsed = current_time - window_start
+            return elapsed < CHARGING_WINDOW_DURATION
+            
+        return False
+    
+    def _update_charging_state(self):
+        """Update charging window state"""
+        current_charging = self._is_charging()
+        last_charging = self.state.get('last_charger_state', False)
+        current_time = time.time()
+        
+        # Charger was disconnected
+        if last_charging and not current_charging:
+            self.state['charging_window_start'] = current_time
+            self.logger.info("Charger disconnected - starting window period")
+        
+        # Charger was connected
+        elif not last_charging and current_charging:
+            self.state['charging_window_start'] = current_time
+            self.logger.info("Charger connected - in charging window")
+        
+        # Reset window if charger reconnected
+        elif current_charging:
+            self.state['charging_window_start'] = current_time
+        
+        self.state['last_charger_state'] = current_charging
+    
+    def _get_expected_soc_from_voltage(self, voltage: float) -> float:
+        """Get expected SOC percentage from voltage using li-ion curve"""
+        if voltage >= LIION_VOLTAGE_CURVE[0][0]:
+            return LIION_VOLTAGE_CURVE[0][1]
+        if voltage <= LIION_VOLTAGE_CURVE[-1][0]:
+            return LIION_VOLTAGE_CURVE[-1][1]
+        
+        # Linear interpolation between curve points
+        for i in range(len(LIION_VOLTAGE_CURVE) - 1):
+            v1, soc1 = LIION_VOLTAGE_CURVE[i]
+            v2, soc2 = LIION_VOLTAGE_CURVE[i + 1]
+            
+            if v2 <= voltage <= v1:
+                # Linear interpolation
+                ratio = (voltage - v2) / (v1 - v2)
+                return soc2 + ratio * (soc1 - soc2)
+        
+        return 50.0  # Default fallback
+    
+    def _is_bad_reading(self, voltage: float, soc: float) -> bool:
+        """Check if reading deviates significantly from expected li-ion curve"""
+        expected_soc = self._get_expected_soc_from_voltage(voltage)
+        deviation = abs(soc - expected_soc) / expected_soc if expected_soc > 0 else 0
+        
+        is_bad = deviation > BAD_READING_THRESHOLD
+        if is_bad:
+            self.logger.warning(f"Bad reading detected: {soc:.1f}% vs expected {expected_soc:.1f}% "
+                              f"(deviation: {deviation:.1%})")
+        
+        return is_bad
+    
+    def _can_quick_start(self) -> bool:
+        """Check if quick-start is allowed (not in cooldown or charging window)"""
+        current_time = time.time()
+        last_quick_start = self.state.get('last_quick_start', 0)
+        
+        # Check cooldown period
+        if current_time - last_quick_start < QUICK_START_COOLDOWN:
+            return False
+        
+        # Never quick-start during charging window
+        if self._is_in_charging_window():
+            return False
+        
+        return True
+    
+    def _send_quick_start(self) -> bool:
+        """Send quick-start command to MAX17043"""
+        if not self._write_register16(MODE_REGISTER, QUICK_START_COMMAND):
+            return False
+        
+        self.state['last_quick_start'] = time.time()
+        self.logger.info("Quick-start command sent successfully")
+        return True
+    
+    def _read_battery_data(self) -> Optional[Dict[str, Any]]:
+        """Read battery data from MAX17043"""
+        vcell_raw = self._read_register16(VCELL_REGISTER)
+        soc_raw = self._read_register16(SOC_REGISTER)
+        
+        if vcell_raw is None or soc_raw is None:
+            return None
+        
+        # Convert raw values according to datasheet
+        voltage = (vcell_raw >> 4) * 1.25 / 1000.0  # Convert to volts
+        soc_percent = (soc_raw >> 8) + (soc_raw & 0xFF) / 256.0  # High byte + fractional
+        
+        return {
+            'voltage': voltage,
+            'percent_user': soc_percent,
+            'percent_raw': soc_percent,
+            'timestamp': time.time(),
+            'charging': self._is_charging(),
+            'in_window': self._is_in_charging_window()
         }
+    
+    def _write_status_file(self, battery_data: Dict[str, Any]):
+        """Write battery data to status file for widget consumption"""
+        try:
+            status = {
+                'battery': battery_data,
+                'timestamp': time.time()
+            }
+            
+            with open(STATUS_FILE, 'w') as f:
+                json.dump(status, f, indent=2)
+                
+        except OSError as e:
+            self.logger.error(f"Failed to write status file: {e}")
+    
+    def run(self) -> bool:
+        """Run single monitoring cycle"""
+        self.logger.info("Starting battery monitor")
         
-        for addr, name in registers.items():
-            try:
-                raw_value = monitor.bus.read_word_data(monitor.chip_address, addr)
-                swapped = (raw_value & 0xFF) << 8 | (raw_value >> 8)
-                print(f"0x{addr:02X} {name:8}: raw=0x{raw_value:04X}, swapped=0x{swapped:04X}")
-            except Exception as e:
-                print(f"0x{addr:02X} {name:8}: ERROR - {e}")
+        if not self._init_i2c():
+            self.logger.error("Failed to initialize I2C")
+            return False
         
-        print("==============================")
+        if not self._init_gpio():
+            self.logger.error("Failed to initialize GPIO")
+        
+        # Update charging state
+        self._update_charging_state()
+        
+        # Read battery data
+        battery_data = self._read_battery_data()
+        if battery_data is None:
+            self.logger.error("Failed to read battery data")
+            self._write_status_file({'error': 'Failed to read battery data'})
+            self._save_state()
+            return False
+        
+        # Check for bad readings
+        is_bad = self._is_bad_reading(battery_data['voltage'], battery_data['percent_user'])
+        in_window = self._is_in_charging_window()
+        
+        self.logger.info(f"Battery: {battery_data['percent_user']:.1f}%, "
+                        f"{battery_data['voltage']:.3f}V, charging: {battery_data['charging']}, "
+                        f"window: {in_window}, bad_reading: {is_bad}")
+        
+        # Handle bad readings
+        if is_bad and not in_window:
+            if self._can_quick_start():
+                self.logger.warning("Bad reading detected outside window - sending quick-start")
+                self._send_quick_start()
+                # Wait for stabilization and re-read
+                time.sleep(2)
+                new_data = self._read_battery_data()
+                if new_data:
+                    battery_data = new_data
+            else:
+                self.logger.warning("Bad reading detected but quick-start not allowed")
+        elif is_bad and in_window:
+            self.logger.info("Bad reading detected during charging window - ignoring")
+        
+        # Write status file
+        self._write_status_file(battery_data)
+        self._save_state()
+        
         return True
-        
-    except Exception as e:
-        print(f"Failed to dump registers: {e}")
-        return False
-
-
-def test_alert_values():
-    """Test different alert threshold values"""
-    try:
-        monitor = BatteryMonitor()
-        
-        # Test different threshold values
-        test_values = [0x00, 0x10, 0x20, 0x22, 0x30, 0x40]
-        
-        print("=== TESTING ALERT THRESHOLDS ===")
-        
-        for test_val in test_values:
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.gpio_ready:
             try:
-                # Read current config
-                config_raw = monitor.bus.read_word_data(monitor.chip_address, 0x0C)
-                config_swapped = (config_raw & 0xFF) << 8 | (config_raw >> 8)
-                
-                # Set new threshold in upper 8 bits
-                new_config = (test_val << 8) | (config_swapped & 0xFF)
-                config_to_write = ((new_config & 0xFF) << 8) | (new_config >> 8)
-                
-                # Write and verify
-                monitor.bus.write_word_data(monitor.chip_address, 0x0C, config_to_write)
-                time.sleep(0.1)
-                
-                # Read back
-                verify_raw = monitor.bus.read_word_data(monitor.chip_address, 0x0C)
-                verify_swapped = (verify_raw & 0xFF) << 8 | (verify_raw >> 8)
-                actual_threshold = verify_swapped >> 8
-                
-                # Calculate percentages
-                raw_pct = 32 - (actual_threshold / 2)
-                user_pct = (raw_pct - 15) * 1.176470588
-                
-                print(f"Set 0x{test_val:02X} -> Got 0x{actual_threshold:02X} -> {raw_pct}% raw -> {user_pct:.1f}% user")
-                
-            except Exception as e:
-                print(f"Error testing 0x{test_val:02X}: {e}")
-        
-        print("=================================")
-        return True
-        
-    except Exception as e:
-        print(f"Failed to test alert values: {e}")
-        return False
+                GPIO.cleanup()
+            except:
+                pass
 
 
 def main():
-    """Main execution"""
-    import sys
-    
-    # Handle commands
-    if len(sys.argv) > 1:
-        command = sys.argv[1]
-        if command == 'reset':
-            manual_reset()
-            return
-        elif command == 'dump-registers':
-            dump_all_registers()
-            return
-        elif command == 'test-alert':
-            test_alert_values()
-            return
-        else:
-            print("Available commands:")
-            print("  reset          - Reset fuel gauge chip")
-            print("  dump-registers - Show all MAX17048 registers")
-            print("  test-alert     - Test different alert threshold values")
-            return
-    
-    # Normal battery reading
     monitor = BatteryMonitor()
-    status = monitor.read_battery_with_validation()
     
-    if monitor.write_status(status):
-        # Print status for debugging (optional)
-        if 'reset_info' in status:
-            print(f"Battery monitor: {status['reset_info'].get('message', 'Reset performed')}")
-        elif status.get('validation', {}).get('bad_reading'):
-            val = status['validation']
-            print(f"Bad reading {val['bad_count']}/{val['threshold']}: {val['reason']}")
-    else:
-        print("Failed to write battery status")
+    try:
+        success = monitor.run()
+        return 0 if success else 1
+        
+    except KeyboardInterrupt:
+        monitor.logger.info("Interrupted by user")
+        return 0
+    except Exception as e:
+        monitor.logger.error(f"Unexpected error: {e}")
+        return 1
+    finally:
+        monitor.cleanup()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    exit(main())
