@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
 Efficient Battery System Tray Widget
-Optimized version with minimal overhead and smart caching
+Reads battery data from JSON file written by battery monitor script
 """
 
 import json
-import subprocess
 import datetime
 import time
 import os
 from collections import deque
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 import gi
-import RPi.GPIO as GPIO
 
 gi.require_version('Gtk', '3.0')
 gi.require_version('AyatanaAppIndicator3', '0.1')
 
 from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator3
 
-CHARGE_DETECT_PIN = 4
+STATUS_FILE = '/tmp/battery_status.json'
 
 class IconManager:
     """Efficient icon management with comprehensive caching"""
@@ -92,7 +90,7 @@ class IconManager:
         self._level_cache[percentage] = level
         return level
     
-    def _find_icon(self, templates: Tuple[str, ...], level: int) -> Optional[str]:
+    def _find_icon(self, templates: tuple, level: int) -> Optional[str]:
         """Find first working icon from templates"""
         for template in templates:
             if level == 100 and "{}" not in template:
@@ -157,8 +155,8 @@ class IconManager:
 class BatterySystemTray:
     """Efficient battery system tray widget"""
     __slots__ = (
-        'status_file', 'update_interval', 'current_battery', 'was_charging',
-        'initialization_complete', 'icon_manager', 'gpio_ready', 'indicator',
+        'update_interval', 'current_battery', 'was_charging',
+        'initialization_complete', 'icon_manager', 'indicator',
         'status_item', 'runtime_item', 'battery_history', 'last_runtime_estimate',
         'last_timestamp', 'file_mtime', 'cached_battery_data', 'reading_count'
     )
@@ -168,13 +166,11 @@ class BatterySystemTray:
         GLib.set_prgname("")
         
         # Core attributes
-        self.status_file = '/tmp/battery_status.json'
-        self.update_interval = 2000  # 2 seconds for faster reset detection
+        self.update_interval = 2000  # 2 seconds
         self.current_battery = None
         self.was_charging = False
         self.initialization_complete = False
-        self.gpio_ready = False
-        self.reading_count = 0  # Track number of readings
+        self.reading_count = 0
         
         # Caching
         self.file_mtime = 0
@@ -187,32 +183,11 @@ class BatterySystemTray:
         
         # Initialize components
         self.icon_manager = IconManager()
-        self._setup_gpio()
         self._setup_indicator()
         
         # Start efficient polling
         GLib.timeout_add(500, self._check_theme_ready)
         GLib.timeout_add(self.update_interval, self._update_battery)
-    
-    def _setup_gpio(self):
-        """Initialize GPIO efficiently"""
-        try:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(CHARGE_DETECT_PIN, GPIO.IN)
-            self.gpio_ready = True
-        except:
-            self.gpio_ready = False
-    
-    def _is_charging(self) -> bool:
-        """Check charging status efficiently"""
-        if not self.gpio_ready:
-            return False
-        
-        try:
-            return GPIO.input(CHARGE_DETECT_PIN) == GPIO.HIGH
-        except:
-            self.gpio_ready = False
-            return False
     
     def _setup_indicator(self):
         """Setup AppIndicator with minimal initialization"""
@@ -259,17 +234,22 @@ class BatterySystemTray:
         self.indicator.set_menu(menu)
     
     def _read_battery_data(self) -> Optional[Dict]:
-        """Read battery data with file caching"""
+        """Read battery data from JSON file with caching"""
         try:
+            # Check if file exists
+            if not os.path.exists(STATUS_FILE):
+                return None
+                
             # Check if file was modified
-            mtime = os.path.getmtime(self.status_file)
+            mtime = os.path.getmtime(STATUS_FILE)
             if mtime == self.file_mtime and self.cached_battery_data:
                 return self.cached_battery_data
             
-            # Read and cache new data
-            with open(self.status_file, 'r') as f:
+            # Read and parse JSON file
+            with open(STATUS_FILE, 'r') as f:
                 data = json.load(f)
             
+            # Cache the data
             self.file_mtime = mtime
             self.cached_battery_data = data.get('battery')
             return self.cached_battery_data
@@ -302,6 +282,11 @@ class BatterySystemTray:
         time_span = current_time - old_time
         percent_change = old_percent - current_percent
         
+        # Reset history if battery level increased (charging detected)
+        if percent_change < 0:
+            self.battery_history.clear()
+            return "Calculating..."
+        
         # Validate discharge data
         if time_span < 60 or percent_change <= 0:
             return self.last_runtime_estimate
@@ -327,11 +312,9 @@ class BatterySystemTray:
     def _check_theme_ready(self) -> bool:
         """Check theme readiness and initialize"""
         if self.icon_manager.check_theme_ready() and not self.initialization_complete:
-            # Theme ready - initialize immediately with first reading
+            # Theme ready - initialize immediately
             self.icon_manager.preload_icons()
             self.initialization_complete = True
-            
-            # Don't update display yet - wait for second reading for accuracy
             return False  # Stop polling
         
         return True  # Continue polling
@@ -353,32 +336,14 @@ class BatterySystemTray:
         
         percentage = battery['percent_user']
         voltage = battery['voltage']
-        charging = self._is_charging()
+        charging = battery.get('charging', False)
         
         # Update icon
         icon_name = self.icon_manager.get_battery_icon(percentage, charging)
         self.indicator.set_icon(icon_name)
         
-        # Check for reset information
-        status_suffix = ""
-        if self.current_battery:
-            # Check for chip reset info
-            reset_info = self.current_battery.get('reset_info')
-            if reset_info:
-                if reset_info.get('reset_performed'):
-                    status_suffix = " (CHIP RESET)"
-                elif reset_info.get('reset_failed'):
-                    status_suffix = " (RESET FAILED)"
-            
-            # Check for bad reading validation
-            validation = self.current_battery.get('validation')
-            if validation and validation.get('bad_reading'):
-                bad_count = validation.get('bad_count', 0)
-                threshold = validation.get('threshold', 3)
-                status_suffix = f" (BAD {bad_count}/{threshold})"
-        
         # Update menu items
-        status_text = f"Battery: {percentage:.0f}% ({voltage:.2f}V){status_suffix}"
+        status_text = f"Battery: {percentage:.0f}% ({voltage:.2f}V)"
         if charging:
             status_text += " - Charging"
         
@@ -395,12 +360,12 @@ class BatterySystemTray:
         if self.initialization_complete:
             self.reading_count += 1
             
-            # Always read battery data for runtime calculations
+            # Read battery data from JSON file
             battery = self._read_battery_data()
             if battery and 'error' not in battery:
                 # Update current battery data
                 self.current_battery = battery
-                charging = self._is_charging()
+                charging = battery.get('charging', False)
                 
                 # Handle charger state changes for runtime reset
                 if self.was_charging and not charging:
@@ -422,6 +387,7 @@ class BatterySystemTray:
                     self.runtime_item.set_label("Runtime: Calculating...")
             else:
                 # Error case - update display immediately
+                self.current_battery = battery
                 self._update_display()
         
         return True
@@ -429,6 +395,7 @@ class BatterySystemTray:
     def _show_details(self, widget):
         """Show detailed battery information"""
         if not self.current_battery:
+            self._show_message_dialog("No battery data available")
             return
         
         battery = self.current_battery
@@ -442,91 +409,56 @@ class BatterySystemTray:
             except (ValueError, TypeError):
                 pass
         
-        charging = self._is_charging()
+        charging = battery.get('charging', False)
         current_icon = self.icon_manager.get_battery_icon(battery['percent_user'], charging)
         
         details = (
             f"Charge: {battery['percent_user']:.1f}%\n"
             f"Voltage: {battery['voltage']:.3f}V\n"
-            f"Raw: {battery['percent_raw']:.1f}%\n"
+            f"Raw: {battery.get('percent_raw', battery['percent_user']):.1f}%\n"
             f"Charging: {'Yes' if charging else 'No'}\n"
             f"Icon: {current_icon}\n"
             f"Updated: {timestamp_str}"
         )
         
-        # Add reset/validation information if present
-        status_data = getattr(self, 'current_battery', {})
-        
-        # Check for reset information
-        reset_info = status_data.get('reset_info')
-        if reset_info:
-            details += "\n\n--- CHIP RESET INFO ---"
-            if reset_info.get('reset_performed'):
-                details += f"\n✓ Chip reset successful"
-                details += f"\nReason: {reset_info.get('reason', 'Unknown')}"
-            elif reset_info.get('reset_failed'):
-                details += f"\n✗ Chip reset failed"
-                details += f"\nReason: {reset_info.get('reason', 'Unknown')}"
-                details += f"\nError: {reset_info.get('error', 'Unknown')}"
-        
-        # Check for validation information
-        validation = status_data.get('validation')
-        if validation and validation.get('bad_reading'):
-            details += "\n\n--- READING VALIDATION ---"
-            details += f"\n⚠ Bad reading detected"
-            details += f"\nReason: {validation.get('reason', 'Unknown')}"
-            details += f"\nCount: {validation.get('bad_count', 0)}/{validation.get('threshold', 3)}"
-        
-        try:
-            subprocess.run(['zenity', '--info', '--title', 'Battery Details', 
-                          '--text', details], timeout=30)
-        except:
-            pass
+        self._show_message_dialog("Battery Details", details)
     
     def _manual_reset(self, widget):
-        """Manual reset of fuel gauge chip"""
+        """Trigger manual fuel gauge reset via monitor script"""
+        import subprocess
         try:
-            # Run the battery script with reset command
-            result = subprocess.run(['/usr/bin/python3', '/usr/local/bin/battery-oneshot.py', 'reset'], 
-                                   capture_output=True, text=True, timeout=10)
-            
+            # Call the monitor script to handle reset
+            result = subprocess.run(['python3', '/usr/local/bin/battery_monitor.py', '--reset'], 
+                                  capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
-                message = "Fuel gauge chip reset successful.\nBattery readings should be more accurate now."
-                title = "Reset Complete"
+                self._show_message_dialog("Reset Complete", "Fuel gauge reset successfully")
             else:
-                message = f"Reset failed.\nError: {result.stderr or 'Unknown error'}"
-                title = "Reset Failed"
-            
-            # Show result dialog
-            subprocess.run(['zenity', '--info', '--title', title, '--text', message], 
-                          timeout=30)
-            
-            # Force immediate battery update
-            GLib.timeout_add(1000, lambda: self._update_display() or False)
-            
-        except subprocess.TimeoutExpired:
-            subprocess.run(['zenity', '--error', '--title', 'Reset Error', 
-                          '--text', 'Reset command timed out'], timeout=30)
-        except Exception as e:
-            subprocess.run(['zenity', '--error', '--title', 'Reset Error', 
-                          '--text', f'Reset command failed: {e}'], timeout=30)
+                self._show_message_dialog("Reset Failed", f"Error: {result.stderr}")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            self._show_message_dialog("Reset Failed", f"Could not execute reset: {e}")
+    
+    def _show_message_dialog(self, title, message=""):
+        """Show simple message dialog"""
+        dialog = Gtk.MessageDialog(
+            parent=None,
+            flags=0,
+            type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            message_format=title
+        )
+        if message:
+            dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
 
 
 def main():
     """Application entry point"""
-    gpio_initialized = False
     try:
         tray = BatterySystemTray()
-        gpio_initialized = tray.gpio_ready
         Gtk.main()
     except KeyboardInterrupt:
         pass
-    finally:
-        if gpio_initialized:
-            try:
-                GPIO.cleanup()
-            except:
-                pass
 
 
 if __name__ == "__main__":
