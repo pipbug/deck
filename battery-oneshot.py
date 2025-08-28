@@ -243,10 +243,10 @@ class BatteryMonitor:
         # Convert raw values according to datasheet
         voltage = (vcell_raw >> 4) * 1.25 / 1000.0  # Convert to volts
         soc_percent = (soc_raw >> 8) + (soc_raw & 0xFF) / 256.0  # High byte + fractional
-        
+        user_percent = min(100.0, max(0.0, (soc_percent - 10.0) * (100.0 / 90.0)))
         return {
             'voltage': voltage,
-            'percent_user': soc_percent,
+            'percent_user': user_percent,
             'percent_raw': soc_percent,
             'timestamp': time.time(),
             'charging': self._is_charging(),
@@ -290,10 +290,10 @@ class BatteryMonitor:
             return False
         
         # Check for bad readings
-        is_bad = self._is_bad_reading(battery_data['voltage'], battery_data['percent_user'])
+        is_bad = self._is_bad_reading(battery_data['voltage'], battery_data['percent_raw'])
         in_window = self._is_in_charging_window()
         
-        self.logger.info(f"Battery: {battery_data['percent_user']:.1f}%, "
+        self.logger.info(f"Battery: {battery_data['percent_raw']:.1f}%, "
                         f"{battery_data['voltage']:.3f}V, charging: {battery_data['charging']}, "
                         f"window: {in_window}, bad_reading: {is_bad}")
         
